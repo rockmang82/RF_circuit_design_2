@@ -21,7 +21,9 @@ from matplotlib.ticker import MultipleLocator
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLineEdit, QLabel, QProgressBar, QInputDialog,
-    QMessageBox, QSizePolicy, QSplitter, QDialog, QComboBox
+    QMessageBox, QSizePolicy, QSplitter, QDialog, QComboBox,
+    QDoubleSpinBox, QDialogButtonBox, QFormLayout,
+    QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView
 )
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QPointF
 from PyQt5.QtGui import QPainter, QPen, QColor, QBrush, QPainterPath, QFont
@@ -52,6 +54,7 @@ class Component:
     y: int
     rotation: int = 0    # 0 or 90
     value: float = None
+    tolerance: float = 5.0  # 단위: %, 범위: 0.0 ~ 50.0, 인스턴스별 독립 저장
     selected: bool = False
     error_highlight: bool = False
 
@@ -686,16 +689,38 @@ class CircuitCanvas(QWidget):
         return None
 
     def _show_value_dialog(self, comp):
-        label = {'R': '\u03A9', 'L': 'nH', 'C': 'pF'}[comp.type]
+        unit_label = {'R': '\u03A9', 'L': 'nH', 'C': 'pF'}[comp.type]
         hint = {'R': '예: 50', 'L': '예: 10', 'C': '예: 3.3'}[comp.type]
-        val, ok = QInputDialog.getDouble(
-            self, f'{comp.type} 값 입력',
-            f'값을 입력하세요 (단위: {label})\n{hint}',
-            value=comp.value or 0.0,
-            min=1e-9, max=1e9, decimals=4
-        )
-        if ok:
-            comp.value = val
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f'{comp.type} 값 입력')
+        layout = QFormLayout(dlg)
+
+        # 소자 값 입력
+        val_spin = QDoubleSpinBox()
+        val_spin.setRange(1e-9, 1e9)
+        val_spin.setDecimals(4)
+        val_spin.setValue(comp.value or 0.0)
+        val_spin.setSuffix(f' {unit_label}')
+        layout.addRow(f'값 ({hint}):', val_spin)
+
+        # Tolerance 입력
+        tol_spin = QDoubleSpinBox()
+        tol_spin.setRange(0.0, 50.0)
+        tol_spin.setDecimals(1)
+        tol_spin.setSingleStep(0.5)
+        tol_spin.setValue(comp.tolerance)
+        tol_spin.setSuffix(' ±%')
+        layout.addRow('Tolerance:', tol_spin)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addRow(buttons)
+
+        if dlg.exec_() == QDialog.Accepted:
+            comp.value = val_spin.value()
+            comp.tolerance = tol_spin.value()
             comp.error_highlight = False
             self.update()
 
@@ -1352,6 +1377,358 @@ class AdvancedWindow(QDialog):
 
 
 # =============================================================================
+# Section 6.6: Sensitivity Analysis (민감도 분석)
+# =============================================================================
+
+def _solve_mna_single(components, wires, canvas_height, freq_hz):
+    """단일 주파수에서 MNA를 풀어 포트 임피던스 Z를 반환 (CalcWorker 밖에서 사용)"""
+    uf = UnionFind()
+    uf.make_set(('PORT', 'plus'))
+    uf.make_set(('PORT', 'gnd'))
+    for comp in components:
+        if comp.rotation == 0:
+            uf.make_set((comp.id, 'left'))
+            uf.make_set((comp.id, 'right'))
+        else:
+            uf.make_set((comp.id, 'top'))
+            uf.make_set((comp.id, 'bottom'))
+    for wire in wires:
+        pin_a = (wire.start_comp_id, wire.start_pin)
+        pin_b = (wire.end_comp_id, wire.end_pin)
+        uf.make_set(pin_a)
+        uf.make_set(pin_b)
+        uf.union(pin_a, pin_b)
+
+    gnd_root = uf.find(('PORT', 'gnd'))
+    plus_root = uf.find(('PORT', 'plus'))
+    node_map = {gnd_root: 0}
+    next_node = 1
+    if plus_root != gnd_root:
+        node_map[plus_root] = next_node
+        next_node += 1
+    for key in uf.parent:
+        root = uf.find(key)
+        if root not in node_map:
+            node_map[root] = next_node
+            next_node += 1
+
+    component_nodes = {}
+    for comp in components:
+        if comp.rotation == 0:
+            pin_a, pin_b = (comp.id, 'left'), (comp.id, 'right')
+        else:
+            pin_a, pin_b = (comp.id, 'top'), (comp.id, 'bottom')
+        component_nodes[comp.id] = (node_map[uf.find(pin_a)], node_map[uf.find(pin_b)])
+
+    N = next_node - 1
+    if N <= 0:
+        return complex('inf')
+
+    G = np.zeros((N, N), dtype=complex)
+    I_vec = np.zeros(N, dtype=complex)
+    omega = 2 * math.pi * freq_hz
+
+    for comp in components:
+        na, nb = component_nodes[comp.id]
+        val = comp.value
+        if val is None or val == 0:
+            continue
+        if comp.type == 'R':
+            Y = 1.0 / val
+        elif comp.type == 'L':
+            L_h = val * 1e-9
+            if abs(omega * L_h) < 1e-30:
+                continue
+            Y = 1.0 / (1j * omega * L_h)
+        elif comp.type == 'C':
+            C_f = val * 1e-12
+            Y = 1j * omega * C_f
+        else:
+            continue
+        a, b = na - 1, nb - 1
+        if a >= 0:
+            G[a, a] += Y
+        if b >= 0:
+            G[b, b] += Y
+        if a >= 0 and b >= 0:
+            G[a, b] -= Y
+            G[b, a] -= Y
+
+    I_vec[0] = 1.0
+    try:
+        V = linalg.solve(G, I_vec)
+        return V[0] / 1.0
+    except (linalg.LinAlgError, np.linalg.LinAlgError):
+        return complex('inf')
+
+
+def compute_local_sensitivity(components, wires, canvas_height, freq_hz):
+    """회로 민감도 분석 — 중심차분(central difference) 기반 로컬 민감도 계산
+
+    Returns:
+        list of dict: 소자별 민감도 결과 (|S_normalized| 내림차순 정렬)
+    """
+    # 공칭값으로 |Z_nominal| 계산
+    Z_nominal = _solve_mna_single(components, wires, canvas_height, freq_hz)
+    Z_nom_mag = abs(Z_nominal)
+    if Z_nom_mag == 0 or Z_nominal == complex('inf'):
+        Z_nom_mag = 1e-30  # 0 나눗셈 방지
+
+    results = []
+    unit_map = {'R': '\u03A9', 'L': 'nH', 'C': 'pF'}
+
+    for idx, comp in enumerate(components):
+        if comp.value is None:
+            continue
+
+        name = f"{comp.type}{idx + 1}"
+        xi_nominal = comp.value
+        tol = comp.tolerance
+
+        # delta 계산: tolerance 기반 perturbation
+        if xi_nominal == 0:
+            delta = 1e-9  # 공칭값 0인 소자: 고정 delta
+            warn = True
+        else:
+            delta = xi_nominal * (tol / 100.0)
+            if delta == 0:
+                delta = abs(xi_nominal) * 0.01  # tolerance 0%인 경우 1% 사용
+            warn = False
+
+        # perturbation 적용 (깊은 복사 없이 값만 변경 후 복원)
+        original_val = comp.value
+        try:
+            # +delta
+            comp.value = xi_nominal + delta
+            Z_plus = _solve_mna_single(components, wires, canvas_height, freq_hz)
+            Z_plus_mag = abs(Z_plus)
+
+            # -delta
+            comp.value = xi_nominal - delta
+            Z_minus = _solve_mna_single(components, wires, canvas_height, freq_hz)
+            Z_minus_mag = abs(Z_minus)
+
+            # 값 복원
+            comp.value = original_val
+
+            # 민감도 계산
+            dZ_dXi = (Z_plus_mag - Z_minus_mag) / (2 * delta)
+            S_normalized = dZ_dXi * (xi_nominal / Z_nom_mag) if Z_nom_mag > 1e-30 else 0.0
+            S_absolute = dZ_dXi
+
+        except Exception:
+            comp.value = original_val
+            S_normalized = float('nan')
+            S_absolute = float('nan')
+
+        results.append({
+            'name': name + ('*' if warn else ''),
+            'value': xi_nominal,
+            'unit': unit_map[comp.type],
+            'tolerance': tol,
+            'delta_x': delta,
+            'S_normalized': S_normalized,
+            'S_absolute': S_absolute,
+        })
+
+    # |S_normalized| 내림차순 정렬
+    results.sort(key=lambda r: abs(r['S_normalized']) if not math.isnan(r['S_normalized']) else 0, reverse=True)
+
+    return results, Z_nominal
+
+
+class SensitivityInputDialog(QDialog):
+    """1단계 팝업 — 민감도 분석 주파수 입력"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Sensitivity Analysis \u2014 Frequency Input")
+        self.setModal(True)
+        self.setFixedSize(350, 130)
+
+        layout = QVBoxLayout(self)
+
+        # 주파수 입력 행
+        freq_row = QHBoxLayout()
+        freq_row.addWidget(QLabel("Analysis Frequency:"))
+        self._freq_spin = QDoubleSpinBox()
+        self._freq_spin.setRange(0.001, 100000.0)
+        self._freq_spin.setDecimals(3)
+        self._freq_spin.setValue(13.56)
+        self._freq_spin.setSuffix(' MHz')
+        self._freq_spin.setFixedWidth(140)
+        freq_row.addWidget(self._freq_spin)
+        layout.addLayout(freq_row)
+
+        layout.addSpacing(10)
+
+        # 버튼
+        buttons = QDialogButtonBox()
+        btn_run = buttons.addButton("Run Analysis", QDialogButtonBox.AcceptRole)
+        buttons.addButton(QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def get_frequency_hz(self):
+        """입력된 주파수를 Hz 단위로 반환"""
+        return self._freq_spin.value() * 1e6
+
+    def get_frequency_mhz(self):
+        return self._freq_spin.value()
+
+
+class SensitivityResultWindow(QDialog):
+    """2단계 팝업 — 민감도 분석 결과 창 (테이블 + 토네이도 차트)"""
+
+    def __init__(self, results, Z_nominal, freq_hz, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Sensitivity Analysis Results")
+        self.resize(1000, 500)
+        self.setMinimumSize(700, 400)
+        self.setWindowModality(Qt.NonModal)
+
+        self._results = results
+        self._Z_nominal = Z_nominal
+        self._freq_mhz = freq_hz / 1e6
+
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(5, 5, 5, 5)
+
+        # 상단 정보 표시
+        Z_mag = abs(self._Z_nominal)
+        info_text = (
+            f"분석 주파수: {self._freq_mhz:.3f} MHz   |   "
+            f"Z_nominal: {Z_mag:.2f} \u03A9   |   "
+            f"소자 수: {len(self._results)}개"
+        )
+        info_label = QLabel(info_text)
+        info_label.setStyleSheet("font-size: 11pt; padding: 4px; background-color: #F5F5F5;")
+        layout.addWidget(info_label)
+
+        # QSplitter: 좌측 테이블 / 우측 토네이도 차트
+        splitter = QSplitter(Qt.Horizontal)
+
+        # ---- 좌측: 수치 결과 테이블 ----
+        self._table = QTableWidget()
+        self._table.setColumnCount(6)
+        self._table.setHorizontalHeaderLabels([
+            'Component', 'Value', 'Tolerance', '|\u0394Z/\u0394Xi|', 'Norm. S', 'Rank'
+        ])
+        self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._table.horizontalHeader().setStyleSheet(
+            "QHeaderView::section { background-color: #2d5986; color: white; font-weight: bold; }"
+        )
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self._table.verticalHeader().setVisible(False)
+
+        self._populate_table()
+        splitter.addWidget(self._table)
+
+        # ---- 우측: 토네이도 차트 ----
+        self._fig = plt.figure(figsize=(5, 4))
+        self._ax = self._fig.add_subplot(111)
+        self._canvas = FigureCanvasQTAgg(self._fig)
+        self._canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._draw_tornado_chart()
+        splitter.addWidget(self._canvas)
+
+        splitter.setSizes([500, 500])
+        layout.addWidget(splitter)
+
+    def _populate_table(self):
+        """테이블에 민감도 결과 행 채우기"""
+        n = len(self._results)
+        self._table.setRowCount(n)
+
+        # 행 배경색 그라데이션 계산을 위한 최대 |S_normalized|
+        max_s = max((abs(r['S_normalized']) for r in self._results
+                     if not math.isnan(r['S_normalized'])), default=1.0)
+        if max_s == 0:
+            max_s = 1.0
+
+        for row, r in enumerate(self._results):
+            rank = row + 1
+            s_norm = r['S_normalized']
+            s_abs = r['S_absolute']
+
+            # 배경색: 민감도 비례 연한 빨강 그라데이션
+            if not math.isnan(s_norm):
+                intensity = abs(s_norm) / max_s
+                red_val = int(255 - intensity * 50)  # 205~255 범위
+                bg_color = QColor(255, red_val, red_val)
+            else:
+                bg_color = QColor(255, 255, 255)
+
+            items = [
+                (r['name'], Qt.AlignLeft),
+                (f"{r['value']:g} {r['unit']}", Qt.AlignRight),
+                (f"\u00B1{r['tolerance']:.1f}%", Qt.AlignCenter),
+                (f"{s_abs:.3f}" if not math.isnan(s_abs) else "NaN", Qt.AlignRight),
+                (f"{s_norm:.4f}" if not math.isnan(s_norm) else "NaN", Qt.AlignRight),
+                (str(rank), Qt.AlignCenter),
+            ]
+
+            for col, (text, alignment) in enumerate(items):
+                item = QTableWidgetItem(text)
+                item.setTextAlignment(alignment | Qt.AlignVCenter)
+                item.setBackground(bg_color)
+                self._table.setItem(row, col, item)
+
+    def _draw_tornado_chart(self):
+        """토네이도 차트 (수평 막대 그래프) 렌더링"""
+        ax = self._ax
+        ax.clear()
+
+        results = [r for r in self._results if not math.isnan(r['S_normalized'])]
+        if not results:
+            ax.text(0.5, 0.5, "No valid data", transform=ax.transAxes,
+                    ha='center', va='center', fontsize=14, color='#9E9E9E')
+            self._canvas.draw()
+            return
+
+        # |S_normalized| 내림차순 → 차트에서는 아래가 가장 민감 (역순)
+        results_rev = list(reversed(results))
+        names = [r['name'] for r in results_rev]
+        s_norms = [r['S_normalized'] for r in results_rev]
+        s_abs_vals = [r['S_absolute'] for r in results_rev]
+
+        y_pos = np.arange(len(names))
+        colors = ['#d94f3d' if s > 0 else '#4f7fd9' for s in s_norms]
+
+        bars = ax.barh(y_pos, s_norms, color=colors, height=0.6, zorder=3)
+
+        # 각 막대 끝에 수치 레이블
+        for i, (bar, s_val) in enumerate(zip(bars, s_norms)):
+            x_pos = bar.get_width()
+            ha = 'left' if x_pos >= 0 else 'right'
+            offset = 0.01 * max(abs(v) for v in s_norms) if s_norms else 0
+            ax.text(x_pos + (offset if x_pos >= 0 else -offset), i,
+                    f"S={s_val:.3f}", va='center', ha=ha, fontsize=8)
+
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(names, fontsize=9)
+        ax.set_xlabel("Normalized Sensitivity (\u0394Z/Z per \u0394Xi/Xi)", fontsize=9)
+        ax.set_title(f"Tornado Chart \u2014 Local Sensitivity @ {self._freq_mhz:.3f} MHz",
+                     fontsize=10)
+        ax.axvline(x=0, color='black', linewidth=0.5)
+        ax.grid(True, axis='x', color='#E0E0E0', linestyle=':', zorder=0)
+
+        # 두 번째 X축 (twin axis) — S_absolute 점선 scatter
+        ax2 = ax.twiny()
+        ax2.scatter(s_abs_vals, y_pos, marker='o', color='#666666',
+                    s=20, zorder=4, linestyle=':', label='|∂Z/∂Xi|')
+        ax2.set_xlabel("Absolute Sensitivity |\u2202Z/\u2202Xi| (\u03A9/unit)", fontsize=8)
+        ax2.tick_params(labelsize=8)
+
+        self._fig.tight_layout()
+        self._canvas.draw()
+
+
+# =============================================================================
 # Section 7: MainWindow
 # =============================================================================
 
@@ -1365,9 +1742,10 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1200, 600)
 
         self._calc_worker = None
-        self._advanced_window = None  # AdvancedWindow 인스턴스 참조
-        self._last_freqs = None       # 마지막 계산 결과 (주파수)
-        self._last_Z_list = None      # 마지막 계산 결과 (임피던스)
+        self._advanced_window = None     # AdvancedWindow 인스턴스 참조
+        self._sensitivity_window = None  # SensitivityResultWindow 인스턴스 참조
+        self._last_freqs = None          # 마지막 계산 결과 (주파수)
+        self._last_Z_list = None         # 마지막 계산 결과 (임피던스)
         self._user_adjusted_splitter = False  # 사용자가 스플리터를 수동 조절했는지
 
         # Central widget
@@ -1501,6 +1879,25 @@ class MainWindow(QMainWindow):
         """)
         self._btn_advanced.clicked.connect(self._on_advanced_clicked)
         btn_row.addWidget(self._btn_advanced)
+
+        # Sensitivity Analysis 버튼 (Advanced와 동일 스타일)
+        self._btn_sensitivity = QPushButton("Sensitivity Analysis")
+        self._btn_sensitivity.setFixedSize(140, 28)
+        self._btn_sensitivity.setStyleSheet("""
+            QPushButton {
+                background-color: #4A90D9;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                font-size: 10pt;
+            }
+            QPushButton:hover {
+                background-color: #357ABD;
+            }
+        """)
+        self._btn_sensitivity.clicked.connect(self._on_sensitivity_analysis_clicked)
+        btn_row.addWidget(self._btn_sensitivity)
+
         right_layout.addLayout(btn_row)
 
         # Smith Chart
@@ -1547,6 +1944,44 @@ class MainWindow(QMainWindow):
                 self._advanced_window.update_plots(
                     self._last_freqs, self._last_Z_list
                 )
+
+    def _on_sensitivity_analysis_clicked(self):
+        """Sensitivity Analysis 버튼 클릭 핸들러"""
+        canvas = self.circuit_canvas
+
+        # 소자 존재 여부 확인
+        if len(canvas.components) < 1:
+            QMessageBox.warning(self, "분석 불가",
+                                "소자가 없습니다.\n소자를 배치한 후 다시 시도하세요.")
+            return
+
+        # 값 미입력 소자 확인
+        missing = [c for c in canvas.components if c.value is None]
+        if missing:
+            QMessageBox.warning(self, "분석 불가",
+                                "값이 입력되지 않은 소자가 있습니다.\n모든 소자에 값을 입력하세요.")
+            return
+
+        # 1단계: 주파수 입력
+        dlg = SensitivityInputDialog(parent=self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        freq_hz = dlg.get_frequency_hz()
+
+        # 민감도 계산
+        try:
+            results, Z_nominal = compute_local_sensitivity(
+                canvas.components, canvas.wires, canvas.height(), freq_hz
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Analysis Error", str(e))
+            return
+
+        # 2단계: 결과 창 오픈 (Non-modal)
+        self._sensitivity_window = SensitivityResultWindow(
+            results, Z_nominal, freq_hz, parent=self
+        )
+        self._sensitivity_window.show()
 
     def _set_placement(self, comp_type):
         self._reset_tool_buttons()
